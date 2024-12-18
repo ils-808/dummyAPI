@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, Path, Query
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, Path, Request, status, APIRouter
+from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi_sqlalchemy import DBSessionMiddleware, db
 from sqlalchemy import Column, String, DateTime, create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -10,6 +12,7 @@ from faker import Faker
 
 # Инициализация приложения
 app = FastAPI(title="Multi-user Buggy API", version="1.0", description="API with intentional bugs", redoc_url=None)
+router = APIRouter()
 faker = Faker()
 
 # Настройки базы данных
@@ -49,8 +52,24 @@ class UserResponse(UserCreate):
     created_date: datetime
 
 
+# Переопределеяем код ошибки, чтобы вместо 422 возвращалась 500ая при неправильной валидации
+# Bug: Returns 500 instead of 400
+async def custom_exception_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.endswith("/users") and request.method == "POST":
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=jsonable_encoder({"detail": exc.errors()}),
+        )
+    else:
+        # Для всех остальных случаев возвращаем стандартную обработку
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=jsonable_encoder({"detail": exc.errors()}),
+        )
+
+
 # Эндпоинты API
-@app.get("/", response_class=PlainTextResponse, include_in_schema=False)
+@app.get("/", include_in_schema=False)
 def root():
     """Root endpoint to display a custom message"""
     return {"message": "Welcome to the Multi-user Buggy API! Use /docs for Swagger documentation."}
@@ -89,9 +108,6 @@ def list_users(namespace: str):
 def create_user(namespace: str, user: UserCreate):
     """Create a new user"""
     with db():
-        if not user.login:
-            # Bug: Returns 500 instead of 400
-            raise HTTPException(status_code=500, detail="Login is required")
         existing_user = db.session.query(User).filter_by(namespace=namespace, login=user.login).first()
         if existing_user:
             raise HTTPException(status_code=400, detail="Login must be unique")
@@ -143,3 +159,10 @@ def delete_user(namespace: str, user_id: str):
         db.session.delete(user)
         db.session.commit()
     return None
+
+
+# Подключение маршрутов и обработчиков
+app.include_router(router)
+
+# Установка кастомного обработчика исключений
+app.add_exception_handler(RequestValidationError, custom_exception_handler)
