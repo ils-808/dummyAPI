@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi.responses import PlainTextResponse
 from fastapi_sqlalchemy import DBSessionMiddleware, db
 from sqlalchemy import Column, String, DateTime, create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -49,7 +50,7 @@ class UserResponse(UserCreate):
 
 
 # Эндпоинты API
-@app.get("/", summary="Root Endpoint")
+@app.get("/", response_class=PlainTextResponse, include_in_schema=False)
 def root():
     """Root endpoint to display a custom message"""
     return {"message": "Welcome to the Multi-user Buggy API! Use /docs for Swagger documentation."}
