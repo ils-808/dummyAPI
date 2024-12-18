@@ -75,6 +75,12 @@ def root():
     return {"message": "Welcome to the Multi-user Buggy API! Use /docs for Swagger documentation."}
 
 
+@app.head("/", include_in_schema=False)
+def root_head():
+    """Root endpoint for HEAD requests (monitoring)"""
+    return JSONResponse(status_code=200)
+
+
 @app.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users")
 def init_namespace():
     """Initialize a new namespace with prepopulated users"""
