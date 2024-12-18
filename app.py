@@ -1,158 +1,144 @@
-from flask import Flask, request
-from flask_restx import Api, Resource, fields
-from flask_sqlalchemy import SQLAlchemy
+from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi_sqlalchemy import DBSessionMiddleware, db
+from sqlalchemy import Column, String, DateTime, create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from pydantic import BaseModel, Field
 from datetime import datetime
 import uuid
 from faker import Faker
 
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['RESTX_MASK_SWAGGER'] = False
-
+# Инициализация приложения
+app = FastAPI(title="Multi-user Buggy API", version="1.0", description="API with intentional bugs", redoc_url=None)
 faker = Faker()
-db = SQLAlchemy(app)
-api = Api(app, title="Multi-user Buggy API", version="1.0", description="API with intentional bugs", mask=False)
+
+# Настройки базы данных
+DATABASE_URL = "sqlite:///./users.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+app.add_middleware(DBSessionMiddleware, db_url=DATABASE_URL)
 
 
-# User model for database
-class User(db.Model):
-    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    namespace = db.Column(db.String(36), nullable=False)
-    login = db.Column(db.String(80), nullable=False)
-    created_date = db.Column(db.DateTime, default=datetime.now())
-    fio = db.Column(db.String(120), nullable=True)
-    address = db.Column(db.String(200), nullable=True)
+# Модель базы данных
+class User(Base):
+    __tablename__ = "users"
 
-    # def to_dict(self):
-    #     return {
-    #         "id": self.id,
-    #         "namespace": self.namespace,
-    #         "login": self.login,
-    #         "created_date": self.created_date.isoformat(),
-    #         "fio": self.fio,
-    #         "address": self.address
-    #     }
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    namespace = Column(String(36), nullable=False)
+    login = Column(String(80), nullable=False)
+    created_date = Column(DateTime, default=datetime.now)
+    fio = Column(String(120), nullable=True)
+    address = Column(String(200), nullable=True)
 
 
-# API Models
-user_model = api.model('User', {
-    'login': fields.String(required=True, description="Unique login"),
-    'fio': fields.String(description="Full name"),
-    'address': fields.String(description="Address")
-})
-
-user_response_model = api.model('UserResponse', {
-    'id': fields.String(description="User ID"),
-    'namespace': fields.String(description="Namespace"),
-    'login': fields.String(description="Unique login"),
-    'created_date': fields.String(description="Creation date"),
-    'fio': fields.String(description="Full name"),
-    'address': fields.String(description="Address")
-})
+Base.metadata.create_all(bind=engine)
 
 
-# Initialize DB
-# db.create_all()
+# Pydantic модели
+class UserCreate(BaseModel):
+    login: str = Field(..., description="Unique login")
+    fio: str = Field(None, description="Full name")
+    address: str = Field(None, description="Address")
 
-@api.route('/init')
-class InitNamespace(Resource):
-    def get(self):
-        """Initialize a new namespace with prepopulated users"""
-        namespace = str(uuid.uuid4())
+
+class UserResponse(UserCreate):
+    id: str
+    namespace: str
+    created_date: datetime
+
+
+# Эндпоинты API
+@app.get("/", summary="Root Endpoint")
+def root():
+    """Root endpoint to display a custom message"""
+    return {"message": "Welcome to the Multi-user Buggy API! Use /docs for Swagger documentation."}
+
+
+@app.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users")
+def init_namespace():
+    """Initialize a new namespace with prepopulated users"""
+    namespace = str(uuid.uuid4())
+    with db():
         for _ in range(3):
             user = User(
                 namespace=namespace,
                 login=faker.unique.user_name(),
                 fio=faker.name(),
-                address=faker.address()
+                address=faker.address(),
             )
             db.session.add(user)
         db.session.commit()
-        return {"namespace": namespace}, 200
+    return {"namespace": namespace}
 
 
-@api.route('/<namespace>/users')
-class Users(Resource):
-    @api.marshal_list_with(user_response_model)
-    def get(self, namespace):
-        """List users in the namespace"""
-        users = User.query.filter_by(namespace=namespace).all()
-        # Bug: Return outdated data (users created during the session may not appear)
-        return users[:-1], 200
+@app.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace")
+def list_users(namespace: str):
+    """List users in the namespace"""
+    with db():
+        users = db.session.query(User).filter_by(namespace=namespace).all()
+    # Bug: Return outdated data (users created during the session may not appear)
+    users = users[:-1]  # Возвращаем только часть пользователей
+    if not users:
+        raise HTTPException(status_code=404, detail="Namespace not found")
+    return users
 
-    @api.expect(user_model, validate=False)
-    @api.marshal_with(user_response_model)
-    @api.response(201, "User created", user_response_model)
-    @api.response(400, "Login is required")
-    def post(self, namespace):
-        """Create a new user"""
-        data = request.json
 
-        login = data.get('login')
-        fio = data.get('fio')
-        address = data.get('address')
-
-        if not login:
+@app.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user")
+def create_user(namespace: str, user: UserCreate):
+    """Create a new user"""
+    with db():
+        if not user.login:
             # Bug: Returns 500 instead of 400
-            return {"error": "Login is required"}, 500
-
-        # Check for login uniqueness within the same namespace
-        existing_user = User.query.filter_by(namespace=namespace, login=login).first()
+            raise HTTPException(status_code=500, detail="Login is required")
+        existing_user = db.session.query(User).filter_by(namespace=namespace, login=user.login).first()
         if existing_user:
-            return {"error": "Login must be unique"}, 400
-
-        user = User(namespace=namespace, login=login, fio=fio, address=address)
-        db.session.add(user)
+            raise HTTPException(status_code=400, detail="Login must be unique")
+        new_user = User(
+            namespace=namespace,
+            login=user.login,
+            fio=user.fio,
+            address=user.address,
+        )
+        db.session.add(new_user)
         db.session.commit()
+        db.session.refresh(new_user)
+    return new_user
 
-        return user, 201
+
+@app.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user")
+def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
+    """Get a single user"""
+    with db():
+        user = db.session.query(User).filter_by(namespace=namespace, id=user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
 
-@api.route('/<namespace>/users/<user_id>')
-class UserResource(Resource):
-    @api.marshal_with(user_response_model)
-    def get(self, namespace, user_id):
-        """Get a single user"""
-        user = User.query.filter_by(namespace=namespace, id=user_id).first()
+@app.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user")
+def update_user(namespace: str, user_id: str, user_update: UserCreate):
+    """Update a user"""
+    with db():
+        user = db.session.query(User).filter_by(namespace=namespace, id=user_id).first()
         if not user:
-            api.abort(404, "User not found")
-        return user
-
-    @api.expect(user_model, validate=False)
-    @api.marshal_with(user_response_model)
-    @api.response(200, "User updated")
-    @api.response(404, "User not found")
-    def put(self, namespace, user_id):
-        """Update a user"""
-        data = request.json
-        user = User.query.filter_by(namespace=namespace, id=user_id).first()
-        if not user:
-            api.abort(404, "User not found")
-
-        # Update without checking login uniqueness
-        user.login = data.get('login', user.login)
-        user.fio = data.get('fio', user.fio)
-        user.address = data.get('address', user.address)
+            raise HTTPException(status_code=404, detail="User not found")
+        # Bug: no login uniqueness validation
+        user.login = user_update.login or user.login
+        user.fio = user_update.fio or user.fio
+        user.address = user_update.address or user.address
         db.session.commit()
+        db.session.refresh(user)
+    return user
 
-        return user, 200  # Bug: Updates are made but may not reflect in GET /users
 
-    @api.response(204, "User deleted")
-    @api.response(404, "User not found")
-    def delete(self, namespace, user_id):
-        """Delete a user"""
-        user = User.query.filter_by(namespace=namespace, id=user_id).first()
+@app.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user")
+def delete_user(namespace: str, user_id: str):
+    """Delete a user"""
+    with db():
+        user = db.session.query(User).filter_by(namespace=namespace, id=user_id).first()
         if not user:
-            api.abort(404, "User not found")
-
+            raise HTTPException(status_code=404, detail="User not found")
         db.session.delete(user)
         db.session.commit()
-
-        return '', 204
-
-
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()  # Обернуто в контекст приложения
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    return None
