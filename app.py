@@ -78,7 +78,7 @@ def root():
 @app.head("/", include_in_schema=False)
 def root_head():
     """Root endpoint for HEAD requests (monitoring)"""
-    return JSONResponse(status_code=200)
+    return JSONResponse(content={}, status_code=200)
 
 
 @app.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users")
