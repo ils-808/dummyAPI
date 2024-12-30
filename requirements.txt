@@ -4,3 +4,5 @@ SQLAlchemy~=2.0.36
 Pydantic~=2.10.3
 Uvicorn~=0.34.0
 FastAPI-SQLAlchemy~=0.2.1
+redis~=5.2.1
+fastapi_limiter~=0.1.6

@@ -1,5 +1,9 @@
-from fastapi import FastAPI, HTTPException, Path, Request, status, APIRouter
+import uvicorn
+from fastapi import FastAPI, HTTPException, Path, Request, status, APIRouter, Depends
 from fastapi.responses import JSONResponse
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+import redis.asyncio as redis
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi_sqlalchemy import DBSessionMiddleware, db
@@ -16,7 +20,7 @@ router = APIRouter()
 faker = Faker()
 
 # Настройки базы данных
-DATABASE_URL = "sqlite:///./users.db"
+DATABASE_URL = "sqlite:///./instance/users.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -52,6 +56,28 @@ class UserResponse(UserCreate):
     created_date: datetime
 
 
+# Redis URL
+# ToDo: динамически нужно определять
+REDIS_URL = "[REDACTED]"
+
+# Лимиты запросов
+LIMIT_REQUESTS = 15
+LIMIT_SECONDS = 60
+
+
+# Инициализация Redis для Rate Limiting
+@app.on_event("startup")
+async def startup():
+    redis_instance = redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+    await FastAPILimiter.init(redis_instance)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    redis_instance = FastAPILimiter.redis
+    await redis_instance.close()
+
+
 # Переопределеяем код ошибки, чтобы вместо 422 возвращалась 500ая при неправильной валидации
 # Bug: Returns 500 instead of 400
 async def custom_exception_handler(request: Request, exc: RequestValidationError):
@@ -69,19 +95,22 @@ async def custom_exception_handler(request: Request, exc: RequestValidationError
 
 
 # Эндпоинты API
-@app.get("/", include_in_schema=False)
+@app.get("/", include_in_schema=False,
+         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def root():
     """Root endpoint to display a custom message"""
     return {"message": "Welcome to the Multi-user Buggy API! Use /docs for Swagger documentation."}
 
 
-@app.head("/", include_in_schema=False)
+@app.head("/", include_in_schema=False,
+          dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def root_head():
     """Root endpoint for HEAD requests (monitoring)"""
-    return JSONResponse(status_code=200)
+    return JSONResponse(content={}, status_code=200)
 
 
-@app.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users")
+@app.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users",
+          dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def init_namespace():
     """Initialize a new namespace with prepopulated users"""
     namespace = str(uuid.uuid4())
@@ -98,7 +127,8 @@ def init_namespace():
     return {"namespace": namespace}
 
 
-@app.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace")
+@app.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace",
+         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def list_users(namespace: str):
     """List users in the namespace"""
     with db():
@@ -110,7 +140,8 @@ def list_users(namespace: str):
     return users
 
 
-@app.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user")
+@app.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user",
+          dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def create_user(namespace: str, user: UserCreate):
     """Create a new user"""
     with db():
@@ -129,7 +160,8 @@ def create_user(namespace: str, user: UserCreate):
     return new_user
 
 
-@app.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user")
+@app.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user",
+         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
     """Get a single user"""
     with db():
@@ -139,7 +171,8 @@ def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
     return user
 
 
-@app.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user")
+@app.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user",
+         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def update_user(namespace: str, user_id: str, user_update: UserCreate):
     """Update a user"""
     with db():
@@ -155,7 +188,8 @@ def update_user(namespace: str, user_id: str, user_update: UserCreate):
     return user
 
 
-@app.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user")
+@app.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user",
+            dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def delete_user(namespace: str, user_id: str):
     """Delete a user"""
     with db():
@@ -172,3 +206,6 @@ app.include_router(router)
 
 # Установка кастомного обработчика исключений
 app.add_exception_handler(RequestValidationError, custom_exception_handler)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
