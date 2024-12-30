@@ -6,6 +6,9 @@ WORKDIR /app
 # Скопировать файлы проекта
 COPY . /app
 
+# Создать папку instance для базы данных
+RUN mkdir -p /app/instance
+
 # Установить зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
