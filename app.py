@@ -13,6 +13,11 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 import uuid
 from faker import Faker
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Инициализация приложения
 app = FastAPI(title="Multi-user Buggy API", version="1.0", description="API with intentional bugs", redoc_url=None)
@@ -57,8 +62,7 @@ class UserResponse(UserCreate):
 
 
 # Redis URL
-# ToDo: динамически нужно определять
-REDIS_URL = "[REDACTED]"
+REDIS_URL = os.getenv("REDIS_URL", "http://lolcahost")
 
 # Лимиты запросов
 LIMIT_REQUESTS = 15

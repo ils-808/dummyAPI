@@ -6,3 +6,4 @@ Uvicorn~=0.34.0
 FastAPI-SQLAlchemy~=0.2.1
 redis~=5.2.1
 fastapi_limiter~=0.1.6
+python-dotenv==1.0.1
