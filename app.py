@@ -20,9 +20,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Инициализация приложения
-app = FastAPI(title="Multi-user Buggy API", version="1.0", description="API with intentional bugs", redoc_url=None)
-router = APIRouter()
+app = FastAPI(redoc_url=None)
+# router = APIRouter()
+v1_router = FastAPI(tags=["Version 1 (Buggy)"], redoc_url=None)
+v2_router = FastAPI(tags=["Version 2 (Fixed)"], redoc_url=None)
+
 faker = Faker()
+
+class ErrorResponse(BaseModel):
+    code: int
+    message: str
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"code": exc.status_code, "message": exc.detail},
+    )
 
 # Настройки базы данных
 DATABASE_URL = "sqlite:///./instance/users.db"
@@ -82,10 +96,34 @@ async def shutdown():
     await redis_instance.close()
 
 
+# Кастомный обработчик для HTTPException
+@v1_router.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.status_code,
+            "message": exc.detail
+        },
+    )
+
+
+# Кастомный обработчик для необработанных исключений
+@v1_router.exception_handler(Exception)
+async def custom_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": 500,
+            "message": "Internal server error"
+        },
+    )
+
+
 # Переопределеяем код ошибки, чтобы вместо 422 возвращалась 500ая при неправильной валидации
 # Bug: Returns 500 instead of 400
 async def custom_exception_handler(request: Request, exc: RequestValidationError):
-    if request.url.path.endswith("/users") and request.method == "POST":
+    if 'v1' in request.url.path and request.url.path.endswith("/users") and request.method == "POST":
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content=jsonable_encoder({"detail": exc.errors()}),
@@ -103,7 +141,7 @@ async def custom_exception_handler(request: Request, exc: RequestValidationError
          dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def root():
     """Root endpoint to display a custom message"""
-    return {"message": "Welcome to the Multi-user Buggy API! Use /docs for Swagger documentation."}
+    return {"message": "Welcome to the Multi-user Buggy API! Use /v1/docs and /v2/docs for Swagger documentation."}
 
 
 @app.head("/", include_in_schema=False,
@@ -113,8 +151,10 @@ def root_head():
     return JSONResponse(content={}, status_code=200)
 
 
-@app.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users",
-          dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v1_router.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users",
+                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v2_router.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users",
+                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def init_namespace():
     """Initialize a new namespace with prepopulated users"""
     namespace = str(uuid.uuid4())
@@ -131,8 +171,8 @@ def init_namespace():
     return {"namespace": namespace}
 
 
-@app.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace",
-         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v1_router.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace",
+               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def list_users(namespace: str):
     """List users in the namespace"""
     with db():
@@ -144,8 +184,19 @@ def list_users(namespace: str):
     return users
 
 
-@app.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user",
-          dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v2_router.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace",
+               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+def list_users(namespace: str):
+    """List users in the namespace"""
+    with db():
+        users = db.session.query(User).filter_by(namespace=namespace).all()
+    if not users:
+        raise HTTPException(status_code=404, detail="Namespace not found")
+    return users
+
+
+@v1_router.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user",
+                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def create_user(namespace: str, user: UserCreate):
     """Create a new user"""
     with db():
@@ -164,8 +215,43 @@ def create_user(namespace: str, user: UserCreate):
     return new_user
 
 
-@app.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user",
-         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v2_router.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user",
+                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+def create_user(namespace: str, user: UserCreate):
+    """Create a new user"""
+    with db():
+        existing_user = db.session.query(User).filter_by(namespace=namespace, login=user.login).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Login must be unique")
+        new_user = User(
+            namespace=namespace,
+            login=user.login,
+            fio=user.fio,
+            address=user.address,
+        )
+        db.session.add(new_user)
+        db.session.commit()
+        db.session.refresh(new_user)
+    return new_user
+
+
+@v1_router.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user",
+               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
+    """Get a single user"""
+    with db():
+        user = db.session.query(User).filter_by(namespace=namespace, id=user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_dict = jsonable_encoder(user)
+    # bug: delete id from response
+    user_dict.pop('id', None)
+
+    return JSONResponse(content=user_dict)
+
+
+@v2_router.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user",
+               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
     """Get a single user"""
     with db():
@@ -175,8 +261,8 @@ def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
     return user
 
 
-@app.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user",
-         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v1_router.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user",
+               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def update_user(namespace: str, user_id: str, user_update: UserCreate):
     """Update a user"""
     with db():
@@ -192,8 +278,42 @@ def update_user(namespace: str, user_id: str, user_update: UserCreate):
     return user
 
 
-@app.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user",
-            dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v2_router.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user",
+               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+def update_user(namespace: str, user_id: str, user_update: UserCreate):
+    """Update a user"""
+    with db():
+        user = db.session.query(User).filter_by(namespace=namespace, id=user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if user_update.login and user_update.login != user.login:
+            existing_user = db.session.query(User).filter_by(namespace=namespace, login=user_update.login).first()
+            if existing_user:
+                raise HTTPException(status_code=400, detail="Login must be unique")
+        user.login = user_update.login or user.login
+        user.fio = user_update.fio or user.fio
+        user.address = user_update.address or user.address
+        db.session.commit()
+        db.session.refresh(user)
+    return user
+
+
+@v1_router.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user",
+                  dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+def delete_user(namespace: str, user_id: str):
+    """Delete a user"""
+    with db():
+        user = db.session.query(User).filter_by(namespace=namespace, id=user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        db.session.delete(user)
+        # Bug: not saving user deletion
+        #db.session.commit()
+    return None
+
+
+@v2_router.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user",
+                  dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
 def delete_user(namespace: str, user_id: str):
     """Delete a user"""
     with db():
@@ -205,11 +325,17 @@ def delete_user(namespace: str, user_id: str):
     return None
 
 
-# Подключение маршрутов и обработчиков
-app.include_router(router)
-
 # Установка кастомного обработчика исключений
-app.add_exception_handler(RequestValidationError, custom_exception_handler)
+v1_router.add_exception_handler(RequestValidationError, custom_exception_handler)
+# app.add_exception_handler
+
+# Подключение маршрутов и обработчиков
+# app.include_router(router)
+# app.include_router(v1_router, prefix="/v1")
+# app.include_router(v2_router, prefix="/v2")
+app.mount('/v1', v1_router)
+app.mount('/v2', v2_router)
+app.mount('/latest', v2_router)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
