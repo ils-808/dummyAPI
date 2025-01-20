@@ -1,3 +1,6 @@
+import json
+from collections import OrderedDict
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Path, Request, status, APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -7,7 +10,7 @@ import redis.asyncio as redis
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi_sqlalchemy import DBSessionMiddleware, db
-from sqlalchemy import Column, String, DateTime, create_engine
+from sqlalchemy import Column, String, DateTime, create_engine, Integer, Float
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pydantic import BaseModel, Field
 from datetime import datetime
@@ -26,17 +29,6 @@ v1_router = FastAPI(tags=["Version 1 (Buggy)"], redoc_url=None)
 v2_router = FastAPI(tags=["Version 2 (Fixed)"], redoc_url=None)
 
 faker = Faker()
-
-class ErrorResponse(BaseModel):
-    code: int
-    message: str
-
-@app.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"code": exc.status_code, "message": exc.detail},
-    )
 
 # Настройки базы данных
 DATABASE_URL = "sqlite:///./instance/users.db"
@@ -59,6 +51,17 @@ class User(Base):
     address = Column(String(200), nullable=True)
 
 
+class Order(Base):
+    __tablename__ = "orders"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    namespace = Column(String(36), nullable=False)
+    product_name = Column(String(120), nullable=False)
+    quantity = Column(Integer, nullable=False, default=1)
+    price = Column(Float, nullable=False, default=0.0)
+    created_date = Column(DateTime, default=datetime.now)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -75,12 +78,29 @@ class UserResponse(UserCreate):
     created_date: datetime
 
 
+class OrderCreate(BaseModel):
+    product_name: str = Field(..., description="Name of the product")
+    quantity: int = Field(..., description="Quantity of the product")
+    price: float = Field(..., description="Price per product")
+
+
+class OrderResponse(OrderCreate):
+    id: str
+    namespace: str
+    created_date: datetime
+
+
 # Redis URL
-REDIS_URL = os.getenv("REDIS_URL", "http://lolcahost")
+REDIS_URL = os.getenv("REDIS_URL", "http://localhost")
 
 # Лимиты запросов
-LIMIT_REQUESTS = 15
-LIMIT_SECONDS = 60
+ENABLE_RATE_LIMITER = os.getenv("ENABLE_RATE_LIMITER", False).lower() == 'true'
+LIMIT_REQUESTS = int(os.getenv("LIMIT_REQUESTS", 15))
+LIMIT_SECONDS = int(os.getenv("LIMIT_SECONDS", 60))
+
+
+def conditional_rate_limiter():
+    return [Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))] if ENABLE_RATE_LIMITER else []
 
 
 # Инициализация Redis для Rate Limiting
@@ -94,30 +114,6 @@ async def startup():
 async def shutdown():
     redis_instance = FastAPILimiter.redis
     await redis_instance.close()
-
-
-# Кастомный обработчик для HTTPException
-@v1_router.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "code": exc.status_code,
-            "message": exc.detail
-        },
-    )
-
-
-# Кастомный обработчик для необработанных исключений
-@v1_router.exception_handler(Exception)
-async def custom_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={
-            "code": 500,
-            "message": "Internal server error"
-        },
-    )
 
 
 # Переопределеяем код ошибки, чтобы вместо 422 возвращалась 500ая при неправильной валидации
@@ -138,23 +134,23 @@ async def custom_exception_handler(request: Request, exc: RequestValidationError
 
 # Эндпоинты API
 @app.get("/", include_in_schema=False,
-         dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+         dependencies=conditional_rate_limiter())
 def root():
     """Root endpoint to display a custom message"""
     return {"message": "Welcome to the Multi-user Buggy API! Use /v1/docs and /v2/docs for Swagger documentation."}
 
 
 @app.head("/", include_in_schema=False,
-          dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+          dependencies=conditional_rate_limiter())
 def root_head():
     """Root endpoint for HEAD requests (monitoring)"""
     return JSONResponse(content={}, status_code=200)
 
 
-@v1_router.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users",
-                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
-@v2_router.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users",
-                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+@v1_router.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users and orders",
+                dependencies=conditional_rate_limiter(), tags=["Init"])
+@v2_router.post("/init", response_model=dict, summary="Initialize a new namespace with prepopulated users and orders",
+                dependencies=conditional_rate_limiter(), tags=["Init"])
 def init_namespace():
     """Initialize a new namespace with prepopulated users"""
     namespace = str(uuid.uuid4())
@@ -167,12 +163,20 @@ def init_namespace():
                 address=faker.address(),
             )
             db.session.add(user)
+        for _ in range(5):
+            order = Order(
+                namespace=namespace,
+                product_name=faker.word(),
+                quantity=faker.random_int(min=1, max=10),
+                price=round(faker.random_number(digits=2), 2)
+            )
+            db.session.add(order)
         db.session.commit()
     return {"namespace": namespace}
 
 
 @v1_router.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace",
-               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+               dependencies=conditional_rate_limiter(), tags=["User"])
 def list_users(namespace: str):
     """List users in the namespace"""
     with db():
@@ -185,7 +189,7 @@ def list_users(namespace: str):
 
 
 @v2_router.get("/{namespace}/users", response_model=list[UserResponse], summary="List users in the namespace",
-               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+               dependencies=conditional_rate_limiter(), tags=["User"])
 def list_users(namespace: str):
     """List users in the namespace"""
     with db():
@@ -196,7 +200,7 @@ def list_users(namespace: str):
 
 
 @v1_router.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user",
-                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+                dependencies=conditional_rate_limiter(), tags=["User"])
 def create_user(namespace: str, user: UserCreate):
     """Create a new user"""
     with db():
@@ -216,7 +220,7 @@ def create_user(namespace: str, user: UserCreate):
 
 
 @v2_router.post("/{namespace}/users", response_model=UserResponse, summary="Create a new user",
-                dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+                dependencies=conditional_rate_limiter(), tags=["User"])
 def create_user(namespace: str, user: UserCreate):
     """Create a new user"""
     with db():
@@ -236,22 +240,32 @@ def create_user(namespace: str, user: UserCreate):
 
 
 @v1_router.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user",
-               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+               dependencies=conditional_rate_limiter(), tags=["User"])
 def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
     """Get a single user"""
     with db():
         user = db.session.query(User).filter_by(namespace=namespace, id=user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     user_dict = jsonable_encoder(user)
-    # bug: delete id from response
+    # bug: Удаляем id, чтобы создать баг
     user_dict.pop('id', None)
 
-    return JSONResponse(content=user_dict)
+    # Упорядочиваем ключи вручную
+    ordered_user_dict = OrderedDict([
+        ("login", user_dict.get("login")),
+        ("fio", user_dict.get("fio")),
+        ("address", user_dict.get("address")),
+        ("namespace", user_dict.get("namespace")),
+        ("created_date", user_dict.get("created_date"))
+    ])
+
+    return JSONResponse(content=ordered_user_dict)
 
 
 @v2_router.get("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Get a single user",
-               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+               dependencies=conditional_rate_limiter(), tags=["User"])
 def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
     """Get a single user"""
     with db():
@@ -262,7 +276,7 @@ def get_user(namespace: str, user_id: str = Path(..., description="User ID")):
 
 
 @v1_router.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user",
-               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+               dependencies=conditional_rate_limiter(), tags=["User"])
 def update_user(namespace: str, user_id: str, user_update: UserCreate):
     """Update a user"""
     with db():
@@ -279,7 +293,7 @@ def update_user(namespace: str, user_id: str, user_update: UserCreate):
 
 
 @v2_router.put("/{namespace}/users/{user_id}", response_model=UserResponse, summary="Update a user",
-               dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+               dependencies=conditional_rate_limiter(), tags=["User"])
 def update_user(namespace: str, user_id: str, user_update: UserCreate):
     """Update a user"""
     with db():
@@ -299,7 +313,7 @@ def update_user(namespace: str, user_id: str, user_update: UserCreate):
 
 
 @v1_router.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user",
-                  dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+                  dependencies=conditional_rate_limiter(), tags=["User"])
 def delete_user(namespace: str, user_id: str):
     """Delete a user"""
     with db():
@@ -308,12 +322,12 @@ def delete_user(namespace: str, user_id: str):
             raise HTTPException(status_code=404, detail="User not found")
         db.session.delete(user)
         # Bug: not saving user deletion
-        #db.session.commit()
+        # db.session.commit()
     return None
 
 
 @v2_router.delete("/{namespace}/users/{user_id}", status_code=204, summary="Delete a user",
-                  dependencies=[Depends(RateLimiter(times=LIMIT_REQUESTS, seconds=LIMIT_SECONDS))])
+                  dependencies=conditional_rate_limiter(), tags=["User"])
 def delete_user(namespace: str, user_id: str):
     """Delete a user"""
     with db():
@@ -325,14 +339,29 @@ def delete_user(namespace: str, user_id: str):
     return None
 
 
+# Эндпоинт для получения заказов
+@v1_router.get("/{namespace}/orders", response_model=list[OrderResponse], summary="List orders in the namespace",
+               dependencies=conditional_rate_limiter(), tags=["Order"])
+def list_orders_v1(namespace: str):
+    """List orders in the namespace"""
+    raise HTTPException(status_code=500, detail="Intentional error for demonstration purposes")
+
+
+@v2_router.get("/{namespace}/orders", response_model=list[OrderResponse], summary="List orders in the namespace",
+               dependencies=conditional_rate_limiter(), tags=["Order"])
+def list_orders_v2(namespace: str):
+    """List orders in the namespace"""
+    with db():
+        orders = db.session.query(Order).filter_by(namespace=namespace).all()
+    if not orders:
+        raise HTTPException(status_code=404, detail="Namespace not found")
+    return orders
+
+
 # Установка кастомного обработчика исключений
 v1_router.add_exception_handler(RequestValidationError, custom_exception_handler)
-# app.add_exception_handler
 
 # Подключение маршрутов и обработчиков
-# app.include_router(router)
-# app.include_router(v1_router, prefix="/v1")
-# app.include_router(v2_router, prefix="/v2")
 app.mount('/v1', v1_router)
 app.mount('/v2', v2_router)
 app.mount('/latest', v2_router)
